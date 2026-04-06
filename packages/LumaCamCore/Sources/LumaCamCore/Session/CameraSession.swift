@@ -26,7 +26,7 @@ public final class CameraSession {
         profile: CameraProfile,
         engine: any StreamPlaybackEngine,
         reconnectPolicy: ReconnectPolicy = ReconnectPolicy(),
-        connectionTimeout: Duration = .seconds(45)
+        connectionTimeout: Duration = .seconds(10)
     ) {
         self.profile = profile
         self.engine = engine
