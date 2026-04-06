@@ -49,7 +49,46 @@ public struct KeychainCredentialStore: CredentialStore {
     }
 
     public func password(for credentialID: String) throws -> String? {
-        var query = baseQuery(for: credentialID, matchAnySynchronizable: true)
+        if let password = try passwordUsingBaseQuery(
+            baseQuery(for: credentialID, matchAnySynchronizable: true, restrictToAccessGroup: true)
+        ) {
+            return password
+        }
+        // iOS uses an explicit access group (Watch sharing); macOS historically used the default
+        // container. Profiles sync via iCloud KVS while keychain items may be stored or synced
+        // without the access-group attribute, so a second lookup without `kSecAttrAccessGroup`
+        // finds those credentials.
+        if accessGroup != nil {
+            return try passwordUsingBaseQuery(
+                baseQuery(for: credentialID, matchAnySynchronizable: true, restrictToAccessGroup: false)
+            )
+        }
+        return nil
+    }
+
+    public func deletePassword(for credentialID: String) throws {
+        let restrictVariants: [Bool] = accessGroup != nil ? [true, false] : [true]
+        var anySuccess = false
+        var fatal: OSStatus?
+
+        for restrict in restrictVariants {
+            let status = SecItemDelete(
+                baseQuery(for: credentialID, matchAnySynchronizable: true, restrictToAccessGroup: restrict) as CFDictionary
+            )
+            if status == errSecSuccess {
+                anySuccess = true
+            } else if status != errSecItemNotFound {
+                fatal = status
+            }
+        }
+
+        if !anySuccess, let fatal {
+            throw StoreError.unexpectedStatus(fatal)
+        }
+    }
+
+    private func passwordUsingBaseQuery(_ base: [String: Any]) throws -> String? {
+        var query = base
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
@@ -71,24 +110,14 @@ public struct KeychainCredentialStore: CredentialStore {
         return password
     }
 
-    public func deletePassword(for credentialID: String) throws {
-        let status = SecItemDelete(baseQuery(for: credentialID, matchAnySynchronizable: true) as CFDictionary)
-
-        if status == errSecSuccess || status == errSecItemNotFound {
-            return
-        }
-
-        throw StoreError.unexpectedStatus(status)
-    }
-
-    private func baseQuery(for credentialID: String, matchAnySynchronizable: Bool) -> [String: Any] {
+    private func baseQuery(for credentialID: String, matchAnySynchronizable: Bool, restrictToAccessGroup: Bool = true) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: credentialID,
         ]
 
-        if let accessGroup {
+        if restrictToAccessGroup, let accessGroup {
             query[kSecAttrAccessGroup as String] = accessGroup
         }
 
