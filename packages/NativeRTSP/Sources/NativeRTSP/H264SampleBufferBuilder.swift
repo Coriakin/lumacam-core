@@ -28,6 +28,15 @@ final class H264SampleBufferBuilder {
 
     var hasFormatDescription: Bool { formatDescription != nil }
 
+    /// Clear accumulated state. Call on reconnect/stream switch, or when the downstream
+    /// renderer/decoder is flushed so timestamps and parameter sets don't carry over.
+    func reset() {
+        formatDescription = nil
+        rtpBaseTimestamp = nil
+        pendingSPS = nil
+        pendingPPS = nil
+    }
+
     /// Pre-configure from out-of-band SPS/PPS (e.g. sprop-parameter-sets from SDP).
     /// Throws if the data is unusable, but the builder remains usable; it will try
     /// again when in-band parameter sets arrive.
@@ -122,10 +131,11 @@ final class H264SampleBufferBuilder {
     }
 
     private func convertToAVCC(annexBChunks: [Data]) throws -> Data {
+        let strippedChunks = annexBChunks.map { stripAnnexBStartCode(from: $0) }.filter { !$0.isEmpty }
+
         var result = Data()
-        for chunk in annexBChunks {
-            let raw = stripAnnexBStartCode(from: chunk)
-            guard !raw.isEmpty else { continue }
+        result.reserveCapacity(strippedChunks.reduce(0) { $0 + 4 + $1.count })
+        for raw in strippedChunks {
             var length = UInt32(raw.count).bigEndian
             withUnsafeBytes(of: &length) { result.append(contentsOf: $0) }
             result.append(contentsOf: raw)

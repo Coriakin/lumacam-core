@@ -32,13 +32,12 @@ struct RTPPacket: Sendable, Equatable {
             throw RTPPacketError.emptyPacket
         }
 
-        let bytes = [UInt8](data)
-        guard bytes.count >= 12 else {
+        guard data.count >= 12 else {
             throw RTPPacketError.truncatedHeader
         }
 
-        let firstByte = bytes[0]
-        let secondByte = bytes[1]
+        let firstByte = data[data.startIndex]
+        let secondByte = data[data.index(after: data.startIndex)]
 
         let version = firstByte >> 6
         guard version == Self.headerVersion else {
@@ -53,14 +52,14 @@ struct RTPPacket: Sendable, Equatable {
 
         var offset = 12
 
-        guard bytes.count >= offset + (csrcCount * 4) else {
+        guard data.count >= offset + (csrcCount * 4) else {
             throw RTPPacketError.truncatedCSRCList
         }
 
         var csrcIdentifiers: [UInt32] = []
         csrcIdentifiers.reserveCapacity(csrcCount)
         for _ in 0..<csrcCount {
-            let identifier = Self.readUInt32(bytes, at: offset)
+            let identifier = Self.readUInt32(data, at: offset)
             csrcIdentifiers.append(identifier)
             offset += 4
         }
@@ -68,40 +67,39 @@ struct RTPPacket: Sendable, Equatable {
         var extensionProfile: UInt16?
         var extensionData: Data?
         if extensionPresent {
-            guard bytes.count >= offset + 4 else {
+            guard data.count >= offset + 4 else {
                 throw RTPPacketError.truncatedExtensionHeader
             }
 
-            let profile = Self.readUInt16(bytes, at: offset)
-            let extensionLengthWords = Int(Self.readUInt16(bytes, at: offset + 2))
+            let profile = Self.readUInt16(data, at: offset)
+            let extensionLengthWords = Int(Self.readUInt16(data, at: offset + 2))
             offset += 4
 
             let extensionLengthBytes = extensionLengthWords * 4
-            guard bytes.count >= offset + extensionLengthBytes else {
+            guard data.count >= offset + extensionLengthBytes else {
                 throw RTPPacketError.truncatedExtensionPayload
             }
 
             extensionProfile = profile
-            extensionData = Data(bytes[offset..<(offset + extensionLengthBytes)])
+            let start = data.index(data.startIndex, offsetBy: offset)
+            let end = data.index(start, offsetBy: extensionLengthBytes)
+            extensionData = Data(data[start..<end])
             offset += extensionLengthBytes
         }
 
         var paddingCount: UInt8 = 0
         if padding {
-            guard let lastByte = bytes.last else {
-                throw RTPPacketError.truncatedPadding
-            }
-            paddingCount = lastByte
-            guard paddingCount > 0, Int(paddingCount) <= bytes.count, offset <= bytes.count - Int(paddingCount) else {
+            paddingCount = data[data.index(before: data.endIndex)]
+            guard paddingCount > 0, Int(paddingCount) <= data.count, offset <= data.count - Int(paddingCount) else {
                 throw RTPPacketError.truncatedPadding
             }
         } else {
-            guard offset <= bytes.count else {
+            guard offset <= data.count else {
                 throw RTPPacketError.truncatedHeader
             }
         }
 
-        let payloadEnd = padding ? bytes.count - Int(paddingCount) : bytes.count
+        let payloadEnd = padding ? data.count - Int(paddingCount) : data.count
         guard offset <= payloadEnd else {
             throw RTPPacketError.truncatedHeader
         }
@@ -111,13 +109,19 @@ struct RTPPacket: Sendable, Equatable {
         hasExtension = extensionPresent
         self.marker = marker
         self.payloadType = payloadType
-        sequenceNumber = Self.readUInt16(bytes, at: 2)
-        timestamp = Self.readUInt32(bytes, at: 4)
-        ssrc = Self.readUInt32(bytes, at: 8)
+        sequenceNumber = Self.readUInt16(data, at: 2)
+        timestamp = Self.readUInt32(data, at: 4)
+        ssrc = Self.readUInt32(data, at: 8)
         self.csrcIdentifiers = csrcIdentifiers
         self.extensionProfile = extensionProfile
         self.extensionData = extensionData
-        payload = Data(bytes[offset..<payloadEnd])
+        if offset == payloadEnd {
+            payload = Data()
+        } else {
+            let start = data.index(data.startIndex, offsetBy: offset)
+            let end = data.index(data.startIndex, offsetBy: payloadEnd)
+            payload = Data(data[start..<end])
+        }
         self.paddingCount = paddingCount
     }
 
@@ -125,14 +129,20 @@ struct RTPPacket: Sendable, Equatable {
         payload.count
     }
 
-    private static func readUInt16(_ bytes: [UInt8], at index: Int) -> UInt16 {
-        (UInt16(bytes[index]) << 8) | UInt16(bytes[index + 1])
+    private static func readUInt16(_ data: Data, at index: Int) -> UInt16 {
+        let i = data.index(data.startIndex, offsetBy: index)
+        let j = data.index(after: i)
+        return (UInt16(data[i]) << 8) | UInt16(data[j])
     }
 
-    private static func readUInt32(_ bytes: [UInt8], at index: Int) -> UInt32 {
-        (UInt32(bytes[index]) << 24)
-            | (UInt32(bytes[index + 1]) << 16)
-            | (UInt32(bytes[index + 2]) << 8)
-            | UInt32(bytes[index + 3])
+    private static func readUInt32(_ data: Data, at index: Int) -> UInt32 {
+        let i0 = data.index(data.startIndex, offsetBy: index)
+        let i1 = data.index(i0, offsetBy: 1)
+        let i2 = data.index(i0, offsetBy: 2)
+        let i3 = data.index(i0, offsetBy: 3)
+        return (UInt32(data[i0]) << 24)
+            | (UInt32(data[i1]) << 16)
+            | (UInt32(data[i2]) << 8)
+            | UInt32(data[i3])
     }
 }

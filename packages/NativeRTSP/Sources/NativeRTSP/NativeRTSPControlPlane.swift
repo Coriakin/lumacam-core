@@ -24,7 +24,6 @@ struct NativeRTSPControlPlaneSuccess: Sendable {
 final class NativeRTSPControlPlaneExecutor: @unchecked Sendable {
     private let context: NativeRTSPControlPlaneContext
     private let connection: NativeRTSPConnection
-    private var cseq = 1
     private var sessionIdentifier: String?
 
     init(context: NativeRTSPControlPlaneContext) {
@@ -95,8 +94,15 @@ final class NativeRTSPControlPlaneExecutor: @unchecked Sendable {
         body: Data?
     ) async throws -> RTSPResponse {
         let requestURL = requestURL ?? context.endpointURL
-        let request = makeRequest(method: method, requestURL: requestURL, additionalHeaders: additionalHeaders, body: body)
-        let response = try await connection.send(request)
+        let response = try await connection.sendRequest(
+            method: method,
+            url: requestURL,
+            userAgent: context.userAgent,
+            sessionIdentifier: sessionIdentifier,
+            additionalHeaders: additionalHeaders,
+            body: body,
+            authorizationHeader: nil
+        )
         if response.statusCode == 401 {
             return try await retryAuthenticated(
                 method: method,
@@ -179,13 +185,15 @@ final class NativeRTSPControlPlaneExecutor: @unchecked Sendable {
                 )
             }
 
-            let authenticatedRequest = makeRequest(
+            let authenticatedResponse = try await connection.sendRequest(
                 method: method,
-                requestURL: requestURL,
+                url: requestURL,
+                userAgent: context.userAgent,
+                sessionIdentifier: sessionIdentifier,
                 additionalHeaders: additionalHeaders,
-                body: body
+                body: body,
+                authorizationHeader: authorizationHeader
             )
-            let authenticatedResponse = try await connection.send(authenticatedRequest, authorizationHeader: authorizationHeader)
 
             if authenticatedResponse.statusCode != 401 {
                 return try validate(authenticatedResponse, method: method)
@@ -242,31 +250,6 @@ final class NativeRTSPControlPlaneExecutor: @unchecked Sendable {
         default:
             throw PlaybackError.transportFailure("The RTSP server returned \(response.statusCode) for \(method.rawValue). \(response.reasonPhrase)")
         }
-    }
-
-    private func makeRequest(
-        method: RTSPMethod,
-        requestURL: URL,
-        additionalHeaders: [RTSPHeader],
-        body: Data?
-    ) -> RTSPRequest {
-        var headers = [
-            RTSPHeader("CSeq", String(cseq)),
-            RTSPHeader("User-Agent", context.userAgent)
-        ]
-        if let sessionIdentifier {
-            headers.append(RTSPHeader("Session", sessionIdentifier))
-        }
-        headers.append(contentsOf: additionalHeaders)
-
-        let request = RTSPRequest(
-            method: method,
-            url: requestURL,
-            headers: headers,
-            body: body
-        )
-        cseq += 1
-        return request
     }
 
     private func parseSessionDescription(from body: Data) throws -> SDPSessionDescription {
@@ -377,6 +360,10 @@ final class NativeRTSPConnection: @unchecked Sendable {
     private let queue = DispatchQueue(label: "se.andreasbjorn.lumacam.native-rtsp.connection")
     private var connection: NWConnection?
     private var receiveBuffer = Data()
+    private var receiveBufferOffset = 0
+    private let connectTimeout: Duration = .seconds(10)
+    private let receiveBufferCompactThreshold = 128 * 1024
+    private var cseq = 1
 
     init(endpointURL: URL) {
         self.endpointURL = endpointURL
@@ -394,36 +381,69 @@ final class NativeRTSPConnection: @unchecked Sendable {
 
         let newConnection = NWConnection(host: NWEndpoint.Host(host), port: port, using: .tcp)
         connection = newConnection
+        cseq = 1
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let resumeGate = OneShotResumeGate()
+        try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        let resumeGate = OneShotResumeGate()
 
-            newConnection.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready:
-                    resumeGate.resumeOnce {
-                        continuation.resume()
+                        newConnection.stateUpdateHandler = { [weak self] state in
+                            switch state {
+                            case .ready:
+                                resumeGate.resumeOnce {
+                                    newConnection.stateUpdateHandler = nil
+                                    continuation.resume()
+                                }
+                            case let .failed(error):
+                                resumeGate.resumeOnce {
+                                    self?.connection = nil
+                                    newConnection.stateUpdateHandler = nil
+                                    continuation.resume(throwing: Self.mapNetworkError(error))
+                                }
+                            case .cancelled:
+                                resumeGate.resumeOnce {
+                                    self?.connection = nil
+                                    newConnection.stateUpdateHandler = nil
+                                    continuation.resume(throwing: PlaybackError.networkUnavailable)
+                                }
+                            default:
+                                break
+                            }
+                        }
+
+                        newConnection.start(queue: self.queue)
                     }
-                case let .failed(error):
-                    resumeGate.resumeOnce {
-                        self?.connection = nil
-                        continuation.resume(throwing: Self.mapNetworkError(error))
+                }
+
+                group.addTask { [connectTimeout] in
+                    try await Task.sleep(for: connectTimeout)
+                    throw PlaybackError.transportFailure("RTSP connect timed out after \(Int(connectTimeout.components.seconds))s.")
+                }
+
+                do {
+                    guard let _ = try await group.next() else {
+                        throw CancellationError()
                     }
-                case .cancelled:
-                    resumeGate.resumeOnce {
-                        self?.connection = nil
-                        continuation.resume(throwing: PlaybackError.networkUnavailable)
-                    }
-                default:
-                    break
+                    group.cancelAll()
+                    return
+                } catch {
+                    group.cancelAll()
+                    newConnection.stateUpdateHandler = nil
+                    newConnection.cancel()
+                    connection = nil
+                    throw error
                 }
             }
-
-            newConnection.start(queue: queue)
+        } onCancel: {
+            newConnection.stateUpdateHandler = nil
+            newConnection.cancel()
+            connection = nil
         }
     }
 
-    func send(_ request: RTSPRequest, authorizationHeader: String? = nil) async throws -> RTSPResponse {
+    private func send(_ request: RTSPRequest, authorizationHeader: String? = nil) async throws -> RTSPResponse {
         guard connection != nil else {
             throw PlaybackError.networkUnavailable
         }
@@ -436,17 +456,76 @@ final class NativeRTSPConnection: @unchecked Sendable {
         return response
     }
 
+    func sendRequest(
+        method: RTSPMethod,
+        url: URL,
+        userAgent: String,
+        sessionIdentifier: String?,
+        additionalHeaders: [RTSPHeader],
+        body: Data?,
+        authorizationHeader: String?
+    ) async throws -> RTSPResponse {
+        var headers = [
+            RTSPHeader("CSeq", String(cseq)),
+            RTSPHeader("User-Agent", userAgent),
+        ]
+        if let sessionIdentifier {
+            headers.append(RTSPHeader("Session", sessionIdentifier))
+        }
+        headers.append(contentsOf: additionalHeaders)
+        cseq += 1
+
+        return try await send(RTSPRequest(method: method, url: url, headers: headers, body: body), authorizationHeader: authorizationHeader)
+    }
+
+    func sendKeepalive(
+        method: RTSPMethod = .options,
+        userAgent: String,
+        sessionIdentifier: String,
+        url: URL
+    ) async throws -> RTSPResponse {
+        let body: Data? = method == .getParameter ? Data() : nil
+        return try await sendRequest(
+            method: method,
+            url: url,
+            userAgent: userAgent,
+            sessionIdentifier: sessionIdentifier,
+            additionalHeaders: [],
+            body: body,
+            authorizationHeader: nil
+        )
+    }
+
+    func sendTeardown(
+        userAgent: String,
+        sessionIdentifier: String,
+        url: URL
+    ) async throws -> RTSPResponse {
+        try await sendRequest(
+            method: .teardown,
+            url: url,
+            userAgent: userAgent,
+            sessionIdentifier: sessionIdentifier,
+            additionalHeaders: [],
+            body: nil,
+            authorizationHeader: nil
+        )
+    }
+
     func close() {
         connection?.cancel()
         connection = nil
         receiveBuffer.removeAll(keepingCapacity: false)
+        receiveBufferOffset = 0
+        cseq = 1
     }
 
     func readInterleavedFrame() async throws -> RTSPInterleavedFrame {
         while true {
-            switch RTSPInterleavedFrameParser.parse(from: receiveBuffer) {
+            compactReceiveBufferIfNeeded()
+            switch RTSPInterleavedFrameParser.parse(from: receiveBuffer.suffix(from: receiveBuffer.index(receiveBuffer.startIndex, offsetBy: receiveBufferOffset))) {
             case let .complete(frame, consumedBytes):
-                receiveBuffer.removeSubrange(0..<consumedBytes)
+                receiveBufferOffset += consumedBytes
                 return frame
             case .incomplete:
                 let chunk = try await receiveChunk()
@@ -457,7 +536,7 @@ final class NativeRTSPConnection: @unchecked Sendable {
                 throw PlaybackError.transportFailure("Unexpected data while waiting for RTSP interleaved RTP: \(error)")
             }
 
-            if receiveBuffer.count > 1_048_576 {
+            if receiveBuffer.count - receiveBufferOffset > 1_048_576 {
                 throw PlaybackError.transportFailure("RTSP interleaved frame buffer exceeded the maximum allowed size.")
             }
         }
@@ -468,29 +547,44 @@ final class NativeRTSPConnection: @unchecked Sendable {
             throw PlaybackError.networkUnavailable
         }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: Self.mapNetworkError(error))
-                } else {
-                    continuation.resume()
-                }
-            })
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let resumeGate = OneShotResumeGate()
+                connection.send(content: data, completion: .contentProcessed { error in
+                    resumeGate.resumeOnce {
+                        if let error {
+                            continuation.resume(throwing: Self.mapNetworkError(error))
+                        } else {
+                            continuation.resume()
+                        }
+                    }
+                })
+            }
+        } onCancel: {
+            connection.cancel()
         }
     }
 
     private func readResponse() async throws -> RTSPResponse {
         while true {
+            compactReceiveBufferIfNeeded()
             // Must read from the socket before the first parse; an empty buffer is not incomplete — it means we have not received yet.
-            if receiveBuffer.isEmpty {
+            if receiveBuffer.count == receiveBufferOffset {
                 let chunk = try await receiveChunk()
                 receiveBuffer.append(chunk)
             }
 
             do {
-                let parsed = try RTSPParser.parseResponse(receiveBuffer)
-                receiveBuffer.removeAll(keepingCapacity: false)
-                return parsed
+                let available = receiveBuffer.suffix(from: receiveBuffer.index(receiveBuffer.startIndex, offsetBy: receiveBufferOffset))
+                if let parsed = try RTSPParser.parseResponse(from: available) {
+                    receiveBufferOffset += parsed.consumedBytes
+                    return parsed.response
+                }
+
+                let chunk = try await receiveChunk()
+                if !chunk.isEmpty {
+                    receiveBuffer.append(chunk)
+                }
             } catch let parserError as RTSPParserError {
                 switch parserError {
                 case .missingHeaderTerminator, .bodyTooShort:
@@ -505,10 +599,17 @@ final class NativeRTSPConnection: @unchecked Sendable {
                 throw PlaybackError.transportFailure(error.localizedDescription)
             }
 
-            if receiveBuffer.count > 1_048_576 {
+            if receiveBuffer.count - receiveBufferOffset > 1_048_576 {
                 throw PlaybackError.transportFailure("RTSP response exceeded the maximum allowed buffered size.")
             }
         }
+    }
+
+    private func compactReceiveBufferIfNeeded() {
+        guard receiveBufferOffset > 0 else { return }
+        guard receiveBufferOffset >= receiveBufferCompactThreshold || receiveBufferOffset == receiveBuffer.count else { return }
+        receiveBuffer.removeSubrange(0..<receiveBufferOffset)
+        receiveBufferOffset = 0
     }
 
     private func receiveChunk() async throws -> Data {
@@ -516,25 +617,32 @@ final class NativeRTSPConnection: @unchecked Sendable {
             throw PlaybackError.networkUnavailable
         }
 
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
-                if let error {
-                    continuation.resume(throwing: Self.mapNetworkError(error))
-                    return
-                }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                let resumeGate = OneShotResumeGate()
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
+                    resumeGate.resumeOnce {
+                        if let error {
+                            continuation.resume(throwing: Self.mapNetworkError(error))
+                            return
+                        }
 
-                if let data, !data.isEmpty {
-                    continuation.resume(returning: data)
-                    return
-                }
+                        if let data, !data.isEmpty {
+                            continuation.resume(returning: data)
+                            return
+                        }
 
-                if isComplete {
-                    continuation.resume(throwing: PlaybackError.networkUnavailable)
-                    return
-                }
+                        if isComplete {
+                            continuation.resume(throwing: PlaybackError.networkUnavailable)
+                            return
+                        }
 
-                continuation.resume(throwing: PlaybackError.transportFailure("RTSP connection yielded no data."))
+                        continuation.resume(throwing: PlaybackError.transportFailure("RTSP connection yielded no data."))
+                    }
+                }
             }
+        } onCancel: {
+            connection.cancel()
         }
     }
 

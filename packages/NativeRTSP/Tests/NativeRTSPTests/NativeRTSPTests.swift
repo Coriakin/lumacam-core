@@ -67,6 +67,38 @@ struct RTSPParserTests {
     }
 }
 
+// MARK: - Integration-level parsing edge cases
+
+@Suite("NativeRTSPConnection buffering")
+struct NativeRTSPConnectionBufferingTests {
+
+    @Test func responseParserDoesNotConsumeFollowingInterleavedFrameBytes() throws {
+        let responseText = "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n"
+        let responseData = try #require(responseText.data(using: .utf8))
+
+        let payload = Data([0xDE, 0xAD, 0xBE, 0xEF])
+        var interleaved = Data([0x24, 0x00, 0x00, 0x04])
+        interleaved.append(payload)
+
+        var combined = Data()
+        combined.append(responseData)
+        combined.append(interleaved)
+
+        let parsed = try #require(try RTSPParser.parseResponse(from: combined))
+        #expect(parsed.response.statusCode == 200)
+
+        let remainder = combined.dropFirst(parsed.consumedBytes)
+        switch RTSPInterleavedFrameParser.parse(from: Data(remainder)) {
+        case .complete(let frame, let consumed):
+            #expect(frame.channel == 0)
+            #expect(frame.payload == payload)
+            #expect(consumed == interleaved.count)
+        default:
+            Issue.record("Expected interleaved frame to remain after RTSP response bytes")
+        }
+    }
+}
+
 // MARK: - RTSP Request Building
 
 @Suite("RTSP Request")
@@ -89,6 +121,14 @@ struct RTSPRequestTests {
         )
         let text = String(data: request.serializedData(), encoding: .utf8)!
         #expect(text.contains("Accept: application/sdp"))
+    }
+
+    @Test func teardownMethodSerializes() {
+        let url = URL(string: "rtsp://cam.local/stream1")!
+        let request = RTSPRequest(method: .teardown, url: url, headers: [RTSPHeader("CSeq", "9")])
+        let text = String(data: request.serializedData(), encoding: .utf8)!
+        #expect(text.hasPrefix("TEARDOWN rtsp://cam.local/stream1 RTSP/1.0\r\n"))
+        #expect(text.contains("CSeq: 9"))
     }
 }
 
@@ -519,6 +559,29 @@ struct H264RTPDepacketizerTests {
         let result = try d.depacketize(packet: makeRTPPacket(sequenceNumber: 1, payload: Data([fuIndicator, fuHeaderStart | 0x40, 0xAB])))
         #expect(result.count == 1)
     }
+
+    @Test func fragmentTooLargeThrowsAndResets() throws {
+        let nalRefIdc: UInt8 = 0x60
+        let nalType: UInt8 = 5
+        let fuIndicator: UInt8 = nalRefIdc | 0x1C
+
+        func makeFrag(start: Bool, end: Bool, data: Data) -> Data {
+            var fuHeader: UInt8 = nalType
+            if start { fuHeader |= 0x80 }
+            if end { fuHeader |= 0x40 }
+            return Data([fuIndicator, fuHeader]) + data
+        }
+
+        let d = H264RTPDepacketizer(maxFragmentBytes: 64)
+        _ = try d.depacketize(packet: makeRTPPacket(sequenceNumber: 1, payload: makeFrag(start: true, end: false, data: Data(repeating: 0x01, count: 50))))
+        #expect(throws: H264RTPDepacketizerError.self) {
+            try d.depacketize(packet: makeRTPPacket(sequenceNumber: 2, payload: makeFrag(start: false, end: false, data: Data(repeating: 0x02, count: 50))))
+        }
+
+        // After a too-large fragment, the depacketizer should accept a new start fragment.
+        let r = try d.depacketize(packet: makeRTPPacket(sequenceNumber: 3, payload: makeFrag(start: true, end: true, data: Data([0xAA]))))
+        #expect(r.count == 1)
+    }
 }
 
 // MARK: - H.264 Sample Buffer Builder
@@ -591,6 +654,22 @@ struct H264SampleBufferBuilderTests {
         let sb = try #require(try builder.process(annexBChunks: [nal], rtpTimestamp: 0x0000_00FF))
         let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
         #expect(abs(pts - Double(0x1FF) / 90000.0) < 0.001)
+    }
+
+    @Test func resetClearsTimestampBaseAndFormatDescription() throws {
+        let builder = H264SampleBufferBuilder(clockRate: 90000)
+        try builder.configure(sps: spsData(), pps: ppsData())
+        let nal = Data([0x00, 0x00, 0x00, 0x01, 0x65, 0x00])
+
+        let sb1 = try #require(try builder.process(annexBChunks: [nal], rtpTimestamp: 1000))
+        #expect(abs(CMSampleBufferGetPresentationTimeStamp(sb1).seconds) < 0.001)
+
+        builder.reset()
+        #expect(builder.hasFormatDescription == false)
+
+        try builder.configure(sps: spsData(), pps: ppsData())
+        let sb2 = try #require(try builder.process(annexBChunks: [nal], rtpTimestamp: 999_000))
+        #expect(abs(CMSampleBufferGetPresentationTimeStamp(sb2).seconds) < 0.001)
     }
 }
 

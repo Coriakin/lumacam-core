@@ -6,18 +6,21 @@ enum H264RTPDepacketizerError: Error, Equatable, Sendable {
     case invalidSTAPA
     case invalidFUHeader
     case outOfOrderFragmentation
+    case fragmentTooLarge(maxBytes: Int, actualBytes: Int)
 }
 
 final class H264RTPDepacketizer: @unchecked Sendable {
     private static let annexBStartCode = Data([0x00, 0x00, 0x00, 0x01])
 
     private let expectedPayloadTypes: Set<UInt8>
+    private let maxFragmentBytes: Int
     private var activeFragment: Data?
     private var activeFragmentSequenceNumber: UInt16?
     private var activeFragmentNALType: UInt8?
 
-    init(expectedPayloadTypes: Set<UInt8> = []) {
+    init(expectedPayloadTypes: Set<UInt8> = [], maxFragmentBytes: Int = 2 * 1024 * 1024) {
         self.expectedPayloadTypes = expectedPayloadTypes
+        self.maxFragmentBytes = maxFragmentBytes
     }
 
     func reset() {
@@ -95,6 +98,11 @@ final class H264RTPDepacketizer: @unchecked Sendable {
             activeFragment = Data(Self.annexBStartCode)
             activeFragment?.append(nalHeader)
             activeFragment?.append(contentsOf: fragmentPayload)
+            if let fragment = activeFragment, fragment.count > maxFragmentBytes {
+                let actual = fragment.count
+                reset()
+                throw H264RTPDepacketizerError.fragmentTooLarge(maxBytes: maxFragmentBytes, actualBytes: actual)
+            }
             activeFragmentSequenceNumber = packet.sequenceNumber
             activeFragmentNALType = reconstructedNALType
 
@@ -120,6 +128,11 @@ final class H264RTPDepacketizer: @unchecked Sendable {
         }
 
         fragment.append(contentsOf: fragmentPayload)
+        if fragment.count > maxFragmentBytes {
+            let actual = fragment.count
+            reset()
+            throw H264RTPDepacketizerError.fragmentTooLarge(maxBytes: maxFragmentBytes, actualBytes: actual)
+        }
         activeFragment = fragment
         activeFragmentSequenceNumber = packet.sequenceNumber
 
