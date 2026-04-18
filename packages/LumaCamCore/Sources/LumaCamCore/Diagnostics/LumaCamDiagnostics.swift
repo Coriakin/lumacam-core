@@ -145,12 +145,19 @@ public enum LumaCamDiagnostics {
 
 public extension CameraEndpoint {
     var redactedRTSPURLString: String {
-        let portDescription = port.map(String.init) ?? "554"
-        if let username {
-            return "rtsp://\(username)@\(host):\(portDescription)\(path)"
+        guard let url = resolvedRTSPURL(),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            let portDescription = port.map(String.init) ?? "554"
+            let normalizedPath = CameraEndpoint.normalizePath(path)
+            if let username {
+                return "rtsp://\(username)@\(host):\(portDescription)\(normalizedPath)"
+            }
+            return "rtsp://\(host):\(portDescription)\(normalizedPath)"
         }
-
-        return "rtsp://\(host):\(portDescription)\(path)"
+        if components.password != nil {
+            components.password = nil
+        }
+        return components.url?.absoluteString ?? url.absoluteString
     }
 
     var diagnosticsSummary: String {
@@ -162,7 +169,7 @@ public extension CameraEndpoint {
 
 public extension CameraProfile {
     var diagnosticsSummary: String {
-        "camera=\(displayName) id=\(id.uuidString.lowercased()) endpoint=\(endpoint.diagnosticsSummary)"
+        "camera=\(displayName) id=\(id.uuidString.lowercased()) endpoint=\(endpoint.diagnosticsSummary) ptz=\(ptz.backend.rawValue)"
     }
 }
 

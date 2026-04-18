@@ -11,11 +11,18 @@ public final class CameraSession {
     public private(set) var statistics: PlaybackStatistics?
     public private(set) var lastError: PlaybackError?
     public private(set) var isVisible = false
+    public private(set) var isAudioEnabled = false
+    /// True when `.playing` but no new video frames have reached the display pipeline for `videoStallThreshold`.
+    public private(set) var isVideoStallSuspected = false
 
     private let reconnectPolicy: ReconnectPolicy
     private let connectionTimeout: Duration
+    /// No new `lastVideoFrameWallClock` for this long while `.playing` ⇒ treat as stalled (if the engine reports a clock).
+    private let videoStallThreshold: Duration
+    private let stallPollInterval: Duration
     private var reconnectTask: Task<Void, Never>?
     private var connectionTimeoutTask: Task<Void, Never>?
+    private var stallMonitorTask: Task<Void, Never>?
     private var isUserInitiatedConnection = false
     private var reconnectAttempt = 0
     private var ignoreNextStop = false
@@ -26,12 +33,16 @@ public final class CameraSession {
         profile: CameraProfile,
         engine: any StreamPlaybackEngine,
         reconnectPolicy: ReconnectPolicy = ReconnectPolicy(),
-        connectionTimeout: Duration = .seconds(10)
+        connectionTimeout: Duration = .seconds(10),
+        videoStallThreshold: Duration = .seconds(5),
+        stallPollInterval: Duration = .milliseconds(500)
     ) {
         self.profile = profile
         self.engine = engine
         self.reconnectPolicy = reconnectPolicy
         self.connectionTimeout = connectionTimeout
+        self.videoStallThreshold = videoStallThreshold
+        self.stallPollInterval = stallPollInterval
 
         LumaCamDiagnostics.log(
             "session created session=\(sessionID.uuidString.lowercased()) \(profile.diagnosticsSummary)",
@@ -49,6 +60,36 @@ public final class CameraSession {
         }
     }
 
+    /// Enable/disable audio for this session (defaults to `false`).
+    ///
+    /// If the session is currently user-connected and visible, this triggers a reconnect so the
+    /// underlying RTSP control plane can negotiate audio tracks (or skip them entirely).
+    public func setAudioEnabled(_ enabled: Bool) {
+        guard isAudioEnabled != enabled else { return }
+        isAudioEnabled = enabled
+
+        if let audioEngine = engine as? AudioConfigurableStreamPlaybackEngine {
+            audioEngine.setAudioEnabled(enabled)
+        }
+
+        guard isUserInitiatedConnection, isVisible else { return }
+
+        LumaCamDiagnostics.log(
+            "audio toggle changed; reconnecting session=\(sessionID.uuidString.lowercased()) enabled=\(enabled)",
+            level: .debug,
+            category: "session",
+            cameraID: profile.id
+        )
+
+        reconnectTask?.cancel()
+        connectionTimeoutTask?.cancel()
+        stopStallMonitoring()
+        reconnectAttempt = 0
+        ignoreNextStop = true
+        engine.stop()
+        startEngine()
+    }
+
     public func connect() {
         LumaCamDiagnostics.log(
             "connect requested session=\(sessionID.uuidString.lowercased()) visible=\(isVisible) state=\(state.diagnosticsSummary)",
@@ -57,6 +98,7 @@ public final class CameraSession {
         )
         reconnectTask?.cancel()
         connectionTimeoutTask?.cancel()
+        stopStallMonitoring()
         reconnectAttempt = 0
         isUserInitiatedConnection = true
         startEngine()
@@ -70,6 +112,7 @@ public final class CameraSession {
         )
         reconnectTask?.cancel()
         connectionTimeoutTask?.cancel()
+        stopStallMonitoring()
         isUserInitiatedConnection = false
         ignoreNextStop = true
         engine.stop()
@@ -89,6 +132,7 @@ public final class CameraSession {
         if !visible {
             reconnectTask?.cancel()
             connectionTimeoutTask?.cancel()
+            stopStallMonitoring()
             if state.isActivePlayback {
                 LumaCamDiagnostics.log(
                     "visibility change stopping active playback session=\(sessionID.uuidString.lowercased())",
@@ -118,6 +162,9 @@ public final class CameraSession {
                 cameraID: profile.id
             )
             state = reconnectAttempt == 0 ? .preparing : .reconnecting(attempt: reconnectAttempt, delay: .zero)
+            if let audioEngine = engine as? AudioConfigurableStreamPlaybackEngine {
+                audioEngine.setAudioEnabled(isAudioEnabled)
+            }
             try engine.prepare(endpoint: profile.endpoint)
             LumaCamDiagnostics.log(
                 "engine prepared session=\(sessionID.uuidString.lowercased()) generation=\(connectionGeneration)",
@@ -169,20 +216,24 @@ public final class CameraSession {
             connectionTimeoutTask?.cancel()
             reconnectAttempt = 0
             lastError = nil
+            startStallMonitoring()
         case let .failed(error):
             finishWithFailure(error)
         case .stopped:
             connectionTimeoutTask?.cancel()
+            stopStallMonitoring()
             scheduleReconnectIfNeeded()
         case .idle:
             connectionTimeoutTask?.cancel()
+            stopStallMonitoring()
         case .preparing, .connecting, .reconnecting:
-            break
+            stopStallMonitoring()
         }
     }
 
     private func finishWithFailure(_ error: PlaybackError) {
         connectionTimeoutTask?.cancel()
+        stopStallMonitoring()
         lastError = error
         state = .failed(error)
         LumaCamDiagnostics.log(
@@ -289,6 +340,46 @@ public final class CameraSession {
             category: "session",
             cameraID: profile.id
         )
+    }
+
+    private func stopStallMonitoring() {
+        stallMonitorTask?.cancel()
+        stallMonitorTask = nil
+        isVideoStallSuspected = false
+    }
+
+    private func startStallMonitoring() {
+        stopStallMonitoring()
+        let threshold = videoStallThreshold
+        let poll = stallPollInterval
+        stallMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: poll)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self else { return }
+                    guard self.state == .playing else { return }
+                    guard let reporter = self.engine as? PlaybackFrameActivityReporting,
+                          let lastClock = reporter.lastVideoFrameWallClock
+                    else {
+                        self.isVideoStallSuspected = false
+                        return
+                    }
+                    let limit = Self.timeInterval(from: threshold)
+                    let elapsed = Date.now.timeIntervalSince(lastClock)
+                    self.isVideoStallSuspected = elapsed > limit
+                }
+            }
+        }
+    }
+
+    private static func timeInterval(from duration: Duration) -> TimeInterval {
+        let parts = duration.components
+        return TimeInterval(parts.seconds) + TimeInterval(parts.attoseconds) / 1e18
     }
 
     private func shouldIgnoreLateStop(

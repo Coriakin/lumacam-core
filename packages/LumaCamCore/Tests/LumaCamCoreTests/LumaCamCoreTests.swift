@@ -18,8 +18,163 @@ final class LumaCamCoreTests: XCTestCase {
             endpoint.resolvedRTSPURL()?.absoluteString,
             "rtsp://viewer:secret@192.168.1.40:554/stream1"
         )
+        XCTAssertEqual(
+            endpoint.redactedRTSPURLString,
+            "rtsp://viewer@192.168.1.40:554/stream1"
+        )
         XCTAssertNil(endpoint.sanitizedForPersistence().resolvedPassword)
         XCTAssertEqual(endpoint.sanitizedForPersistence().persistedCredentialID, endpoint.defaultCredentialID)
+    }
+
+    @MainActor
+    func testEndpointSplitsIPv4HostWithEmbeddedPort() {
+        let endpoint = CameraEndpoint(
+            displayName: "Tapo",
+            host: "192.168.1.202:554",
+            port: 554,
+            path: "/stream1",
+            username: "viewer",
+            preferredTransport: .tcp,
+            resolvedPassword: "x"
+        )
+        XCTAssertEqual(endpoint.host, "192.168.1.202")
+        XCTAssertEqual(endpoint.port, 554)
+        XCTAssertNotNil(endpoint.resolvedRTSPURL())
+        XCTAssertEqual(
+            endpoint.redactedRTSPURLString,
+            "rtsp://viewer@192.168.1.202:554/stream1"
+        )
+    }
+
+    @MainActor
+    func testEndpointEmbeddedPortOverridesSeparatePortField() {
+        let endpoint = CameraEndpoint(
+            displayName: "NVR",
+            host: "cam.example:8554",
+            port: 554,
+            path: "/live",
+            username: "u",
+            resolvedPassword: "p"
+        )
+        XCTAssertEqual(endpoint.host, "cam.example")
+        XCTAssertEqual(endpoint.port, 8554)
+        XCTAssertEqual(
+            endpoint.resolvedRTSPURL()?.absoluteString,
+            "rtsp://u:p@cam.example:8554/live"
+        )
+    }
+
+    func testProfileDecodesWithoutPTZField() throws {
+        let json = """
+        [{
+            "endpoint": {
+                "id": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+                "displayName": "Legacy",
+                "host": "10.0.0.5",
+                "port": 554,
+                "path": "/stream",
+                "preferredTransport": "tcp"
+            },
+            "note": "n",
+            "lastConnectedAt": null
+        }]
+        """.data(using: .utf8)!
+        let profiles = try JSONDecoder().decode([CameraProfile].self, from: json)
+        XCTAssertEqual(profiles.count, 1)
+        XCTAssertEqual(profiles[0].ptz.backend, .disabled)
+        XCTAssertFalse(profiles[0].showsLivePTZOverlay)
+    }
+
+    func testProfileEncodesAndDecodesPTZ() throws {
+        let http = PTZHTTPConfiguration(
+            hostOverride: "ptz.local",
+            port: 8080,
+            useTLS: false,
+            panLeftPath: "/cgi/pan?l=1",
+            panRightPath: "",
+            tiltUpPath: "",
+            tiltDownPath: "",
+            zoomInPath: "",
+            zoomOutPath: "",
+            stopPath: "/cgi/stop"
+        )
+        let profile = CameraProfile(
+            endpoint: CameraEndpoint(displayName: "P", host: "10.0.0.1", path: "/v"),
+            note: "",
+            ptz: PTZConfiguration(backend: .httpCGI, http: http)
+        )
+        let data = try JSONEncoder().encode([profile])
+        let roundtrip = try JSONDecoder().decode([CameraProfile].self, from: data)
+        XCTAssertEqual(roundtrip[0].ptz.backend, .httpCGI)
+        XCTAssertEqual(roundtrip[0].ptz.http.panLeftPath, "/cgi/pan?l=1")
+        XCTAssertEqual(roundtrip[0].ptz.http.stopPath, "/cgi/stop")
+        XCTAssertTrue(roundtrip[0].showsLivePTZOverlay)
+    }
+
+    func testProfileONVIFPTZShowsOverlayWhenUsernamePresent() {
+        let withUser = CameraProfile(
+            endpoint: CameraEndpoint(displayName: "Tapo", host: "10.0.0.1", path: "/s", username: "u"),
+            ptz: PTZConfiguration(backend: .onvif, onvif: PTZONVIFConfiguration())
+        )
+        XCTAssertTrue(withUser.showsLivePTZOverlay)
+
+        let noUser = CameraProfile(
+            endpoint: CameraEndpoint(displayName: "Tapo", host: "10.0.0.1", path: "/s", username: nil),
+            ptz: PTZConfiguration(backend: .onvif, onvif: PTZONVIFConfiguration())
+        )
+        XCTAssertFalse(noUser.showsLivePTZOverlay)
+    }
+
+    func testProfileEncodesAndDecodesONVIFPTZ() throws {
+        let onvif = PTZONVIFConfiguration(hostOverride: "cam.local", port: 2020, useTLS: false)
+        let profile = CameraProfile(
+            endpoint: CameraEndpoint(displayName: "P", host: "10.0.0.1", path: "/v"),
+            ptz: PTZConfiguration(backend: .onvif, onvif: onvif)
+        )
+        let data = try JSONEncoder().encode([profile])
+        let roundtrip = try JSONDecoder().decode([CameraProfile].self, from: data)
+        XCTAssertEqual(roundtrip[0].ptz.backend, .onvif)
+        XCTAssertEqual(roundtrip[0].ptz.onvif.hostOverride, "cam.local")
+        XCTAssertEqual(roundtrip[0].ptz.onvif.port, 2020)
+    }
+
+    func testONVIFPresetParsingFromGetPresetsResponse() {
+        let xml = """
+        <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>
+        <tptz:GetPresetsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+          <tptz:Preset token="000"><tt:Name xmlns:tt="http://www.onvif.org/ver10/schema">Door</tt:Name></tptz:Preset>
+          <tptz:Preset token="001"/>
+        </tptz:GetPresetsResponse>
+        </s:Body></s:Envelope>
+        """
+        let presets = ONVIFPTZPresetParsing.presets(from: xml)
+        XCTAssertEqual(presets.count, 2)
+        XCTAssertEqual(presets[0].token, "000")
+        XCTAssertEqual(presets[0].name, "Door")
+        XCTAssertEqual(presets[0].displayLabel, "Door")
+        XCTAssertEqual(presets[1].token, "001")
+        XCTAssertNil(presets[1].name)
+        XCTAssertEqual(presets[1].displayLabel, "001")
+    }
+
+    @MainActor
+    func testDuplicatedProfileCopiesPTZ() {
+        let ptz = PTZConfiguration(
+            backend: .httpCGI,
+            http: PTZHTTPConfiguration(
+                panLeftPath: "/l",
+                stopPath: "/s"
+            )
+        )
+        let original = CameraProfile(
+            endpoint: CameraEndpoint(displayName: "Cam", host: "h", path: "/p"),
+            note: "note",
+            ptz: ptz
+        )
+        let dup = original.duplicated()
+        XCTAssertEqual(dup.ptz.http.panLeftPath, "/l")
+        XCTAssertEqual(dup.ptz.http.stopPath, "/s")
+        XCTAssertEqual(dup.ptz.backend, .httpCGI)
     }
 
     @MainActor

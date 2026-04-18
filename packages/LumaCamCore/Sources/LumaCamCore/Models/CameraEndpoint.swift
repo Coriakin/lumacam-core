@@ -35,8 +35,10 @@ public struct CameraEndpoint: Identifiable, Codable, Equatable, Sendable {
     ) {
         self.id = id
         self.displayName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.host = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.port = port
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let (normalizedHost, normalizedPort) = Self.normalizeHostPort(trimmedHost, port: port)
+        self.host = normalizedHost
+        self.port = normalizedPort
         self.path = CameraEndpoint.normalizePath(path)
         self.username = CameraEndpoint.normalizeOptional(username)
         self.credentialID = CameraEndpoint.normalizeOptional(credentialID)
@@ -69,6 +71,38 @@ public struct CameraEndpoint: Identifiable, Codable, Equatable, Sendable {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// When the host field contains a pasted `hostname:port` or `[ipv6]:port`, split so `URLComponents` stays valid. Embedded port overrides `port`.
+    static func normalizeHostPort(_ trimmedHost: String, port: Int?) -> (host: String, port: Int?) {
+        if trimmedHost.hasPrefix("[") {
+            guard let closeBracket = trimmedHost.firstIndex(of: "]") else {
+                return (trimmedHost, port)
+            }
+            let bracketed = String(trimmedHost[...closeBracket])
+            let afterBracket = trimmedHost.index(after: closeBracket)
+            guard afterBracket < trimmedHost.endIndex, trimmedHost[afterBracket] == ":" else {
+                return (bracketed, port)
+            }
+            let portStart = trimmedHost.index(after: afterBracket)
+            let portString = String(trimmedHost[portStart...])
+            guard let parsed = Int(portString), (1...65535).contains(parsed) else {
+                return (bracketed, port)
+            }
+            return (bracketed, parsed)
+        }
+
+        let colonSegments = trimmedHost.split(separator: ":", omittingEmptySubsequences: false)
+        guard colonSegments.count == 2,
+              let parsed = Int(String(colonSegments[1])),
+              (1...65535).contains(parsed) else {
+            return (trimmedHost, port)
+        }
+        let hostOnly = String(colonSegments[0])
+        guard !hostOnly.isEmpty else {
+            return (trimmedHost, port)
+        }
+        return (hostOnly, parsed)
     }
 
     public var defaultCredentialID: String {

@@ -133,7 +133,30 @@ private extension SDPParser {
 
     static func parseOrigin(_ value: String) throws -> SDPOrigin {
         let parts = value.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard parts.count == 6 else {
+        if parts.count == 6 {
+            return SDPOrigin(
+                username: parts[0],
+                sessionID: parts[1],
+                sessionVersion: parts[2],
+                networkType: parts[3],
+                addressType: parts[4],
+                unicastAddress: parts[5]
+            )
+        }
+
+        guard parts.count >= 7 else {
+            throw SDPParserError.invalidOrigin(value)
+        }
+
+        guard let anchor = parts.indices.dropFirst(3).first(where: { i in
+            parts[i] == "IN" && i + 2 < parts.count
+                && (parts[i + 1] == "IP4" || parts[i + 1] == "IP6")
+        }) else {
+            throw SDPParserError.invalidOrigin(value)
+        }
+
+        let addressTail = parts[(anchor + 2)...].joined(separator: " ")
+        guard !addressTail.isEmpty else {
             throw SDPParserError.invalidOrigin(value)
         }
 
@@ -141,9 +164,9 @@ private extension SDPParser {
             username: parts[0],
             sessionID: parts[1],
             sessionVersion: parts[2],
-            networkType: parts[3],
-            addressType: parts[4],
-            unicastAddress: parts[5]
+            networkType: parts[anchor],
+            addressType: parts[anchor + 1],
+            unicastAddress: addressTail
         )
     }
 

@@ -19,9 +19,15 @@ let package = Package(
             targets: ["NativeRTSP"]
         ),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.8.0"),
+    ],
     targets: [
         .target(
             name: "LumaCamCore",
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto"),
+            ],
             path: "packages/LumaCamCore/Sources/LumaCamCore"
         ),
         .target(

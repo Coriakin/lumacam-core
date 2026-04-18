@@ -258,6 +258,28 @@ struct SDPParserTests {
         #expect(fmtp?.parameters.contains("sprop-parameter-sets") == true)
     }
 
+    /// TP-Link Tapo (e.g. C210) emits an extra numeric field in `o=` before `IN IP4`.
+    @Test func parsesTapoStyleSessionOrigin() throws {
+        let tapoSDP = """
+            v=0
+            o=- 14665860 31787219 1 IN IP4 192.168.1.202
+            s=Tapo
+            t=0 0
+            m=video 0 RTP/AVP 96
+            a=rtpmap:96 H264/90000
+            a=control:trackID=0
+
+            """
+        let sdp = try SDPParser.parse(tapoSDP)
+        let origin = try #require(sdp.origin)
+        #expect(origin.username == "-")
+        #expect(origin.sessionID == "14665860")
+        #expect(origin.sessionVersion == "31787219")
+        #expect(origin.networkType == "IN")
+        #expect(origin.addressType == "IP4")
+        #expect(origin.unicastAddress == "192.168.1.202")
+    }
+
     @Test func multipleMediaDescriptions() throws {
         let sdpText = """
             v=0
