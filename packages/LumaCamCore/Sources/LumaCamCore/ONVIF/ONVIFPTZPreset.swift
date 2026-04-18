@@ -1,6 +1,6 @@
 import Foundation
 
-/// A position preset stored on the camera (ONVIF GetPresets / GotoPreset).
+/// A position preset stored on the camera (ONVIF GetPresets / GotoPreset / SetPreset / RemovePreset).
 public struct ONVIFPTZPreset: Identifiable, Hashable, Sendable {
     public var token: String
     /// Human-readable name from the camera, when provided.
@@ -57,6 +57,19 @@ public enum ONVIFPTZPresetParsing {
         }
 
         return result
+    }
+
+    /// Extracts `PresetToken` from `SetPresetResponse` (full SOAP envelope is fine).
+    public static func presetTokenFromSetPresetResponse(_ xml: String) -> String? {
+        let pattern = #"<(?:[\w-]+:)?PresetToken[^>]*>([^<]+)</(?:[\w-]+:)?PresetToken>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let ns = xml as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        guard let m = regex.firstMatch(in: xml, options: [], range: full), m.numberOfRanges >= 2 else { return nil }
+        let r = m.range(at: 1)
+        guard r.location != NSNotFound else { return nil }
+        let token = ns.substring(with: r).trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
     }
 
     private static func extractName(from inner: String) -> String? {

@@ -157,6 +157,17 @@ final class LumaCamCoreTests: XCTestCase {
         XCTAssertEqual(presets[1].displayLabel, "001")
     }
 
+    func testONVIFSetPresetResponseParsesPresetToken() {
+        let xml = """
+        <s:Envelope><s:Body>
+        <tptz:SetPresetResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+          <tptz:PresetToken>000010</tptz:PresetToken>
+        </tptz:SetPresetResponse>
+        </s:Body></s:Envelope>
+        """
+        XCTAssertEqual(ONVIFPTZPresetParsing.presetTokenFromSetPresetResponse(xml), "000010")
+    }
+
     @MainActor
     func testDuplicatedProfileCopiesPTZ() {
         let ptz = PTZConfiguration(

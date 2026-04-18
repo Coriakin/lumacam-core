@@ -83,6 +83,53 @@ public final class ONVIFPTZClient: @unchecked Sendable {
         try Self.throwIfSOAPFault(String(data: data, encoding: .utf8) ?? "")
     }
 
+    /// Stores the current PTZ position on the camera as a named preset (`SetPreset`). Returns the new `PresetToken` when the device includes it in the response.
+    public func setPreset(profile: CameraProfile, presetName: String, existingPresetToken: String? = nil) async throws -> String {
+        let trimmed = presetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ONVIFPTZError.parseError("Preset name is empty.")
+        }
+        let (user, pass) = try credentials(from: profile)
+        let binding = try await binding(for: profile, username: user, password: pass)
+        let body = Self.setPresetBody(
+            profileToken: binding.profileToken,
+            presetName: trimmed,
+            presetToken: existingPresetToken
+        )
+        let data = try await soapPOST(
+            url: binding.ptzServiceURL,
+            soapAction: "http://www.onvif.org/ver20/ptz/wsdl/SetPreset",
+            envelopeBody: body,
+            username: user,
+            password: pass
+        )
+        let xml = String(data: data, encoding: .utf8) ?? ""
+        try Self.throwIfSOAPFault(xml)
+        guard let token = ONVIFPTZPresetParsing.presetTokenFromSetPresetResponse(xml) else {
+            throw ONVIFPTZError.parseError("SetPreset response missing PresetToken.")
+        }
+        return token
+    }
+
+    /// Deletes a stored preset slot on the camera (`RemovePreset`).
+    public func removePreset(profile: CameraProfile, presetToken: String) async throws {
+        let trimmed = presetToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ONVIFPTZError.parseError("Empty preset token.")
+        }
+        let (user, pass) = try credentials(from: profile)
+        let binding = try await binding(for: profile, username: user, password: pass)
+        let body = Self.removePresetBody(profileToken: binding.profileToken, presetToken: trimmed)
+        let data = try await soapPOST(
+            url: binding.ptzServiceURL,
+            soapAction: "http://www.onvif.org/ver20/ptz/wsdl/RemovePreset",
+            envelopeBody: body,
+            username: user,
+            password: pass
+        )
+        try Self.throwIfSOAPFault(String(data: data, encoding: .utf8) ?? "")
+    }
+
     // MARK: - Binding
 
     private func binding(for profile: CameraProfile, username: String, password: String) async throws -> Binding {
@@ -252,6 +299,30 @@ public final class ONVIFPTZClient: @unchecked Sendable {
           <tptz:ProfileToken>\(escapeXML(profileToken))</tptz:ProfileToken>
           <tptz:PresetToken>\(escapeXML(presetToken))</tptz:PresetToken>
         </tptz:GotoPreset>
+        """
+    }
+
+    private static func setPresetBody(profileToken: String, presetName: String, presetToken: String?) -> String {
+        let overwrite: String
+        if let t = presetToken?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            overwrite = "\n          <tptz:PresetToken>\(escapeXML(t))</tptz:PresetToken>"
+        } else {
+            overwrite = ""
+        }
+        return """
+        <tptz:SetPreset xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+          <tptz:ProfileToken>\(escapeXML(profileToken))</tptz:ProfileToken>
+          <tptz:PresetName>\(escapeXML(presetName))</tptz:PresetName>\(overwrite)
+        </tptz:SetPreset>
+        """
+    }
+
+    private static func removePresetBody(profileToken: String, presetToken: String) -> String {
+        """
+        <tptz:RemovePreset xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+          <tptz:ProfileToken>\(escapeXML(profileToken))</tptz:ProfileToken>
+          <tptz:PresetToken>\(escapeXML(presetToken))</tptz:PresetToken>
+        </tptz:RemovePreset>
         """
     }
 
