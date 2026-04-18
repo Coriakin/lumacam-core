@@ -78,5 +78,5 @@ This is local-only and typically not something you commit. For reproducible rele
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Security-sensitive reports: [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Repository conventions (commit style, agent notes): [AGENTS.md](AGENTS.md). Security-sensitive reports: [SECURITY.md](SECURITY.md).
 

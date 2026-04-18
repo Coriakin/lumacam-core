@@ -2,6 +2,8 @@
 
 Thanks for helping improve camera compatibility and stability.
 
+Repository conventions for **commit messages**, scopes, and expectations for AI-assisted or automated edits are summarized in [AGENTS.md](AGENTS.md).
+
 ## Quick start
 
 Run tests from the repository root:
