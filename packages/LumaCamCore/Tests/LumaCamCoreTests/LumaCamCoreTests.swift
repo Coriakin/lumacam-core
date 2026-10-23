@@ -283,6 +283,60 @@ final class LumaCamCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testActivationRecoveryRestartsStalePlayingSession() async throws {
+        let engine = MockPlaybackEngine()
+        engine.lastVideoFrameWallClock = Date(timeIntervalSinceNow: -10)
+        let session = CameraSession(
+            profile: CameraProfile(
+                endpoint: CameraEndpoint(displayName: "Driveway", host: "10.0.0.9", path: "/stream")
+            ),
+            engine: engine,
+            videoStallThreshold: .seconds(1),
+            activationRecoveryDelay: .milliseconds(10)
+        )
+
+        session.setVisible(true)
+        session.connect()
+        engine.onStateChange?(.playing)
+        let initialStartCount = engine.startCallCount
+        let initialStopCount = engine.stopCallCount
+
+        session.handleAppDidBecomeActive()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertGreaterThan(engine.stopCallCount, initialStopCount)
+        XCTAssertGreaterThan(engine.startCallCount, initialStartCount)
+        XCTAssertEqual(session.state, .connecting)
+    }
+
+    @MainActor
+    func testActivationRecoveryDoesNotRestartFreshPlayingSession() async throws {
+        let engine = MockPlaybackEngine()
+        engine.lastVideoFrameWallClock = Date()
+        let session = CameraSession(
+            profile: CameraProfile(
+                endpoint: CameraEndpoint(displayName: "Kitchen", host: "10.0.0.10", path: "/stream")
+            ),
+            engine: engine,
+            videoStallThreshold: .seconds(5),
+            activationRecoveryDelay: .milliseconds(10)
+        )
+
+        session.setVisible(true)
+        session.connect()
+        engine.onStateChange?(.playing)
+        let initialStartCount = engine.startCallCount
+        let initialStopCount = engine.stopCallCount
+
+        session.handleAppDidBecomeActive()
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(engine.stopCallCount, initialStopCount)
+        XCTAssertEqual(engine.startCallCount, initialStartCount)
+        XCTAssertEqual(session.state, .playing)
+    }
+
+    @MainActor
     func testRegistryMirrorsToICloudStoreAndAdoptsRemoteChanges() async throws {
         let defaults = UserDefaults(suiteName: #function)!
         defaults.removePersistentDomain(forName: #function)
@@ -380,18 +434,24 @@ private final class MemoryCameraProfileSyncStore: CameraProfileSyncStore {
 }
 
 @MainActor
-private final class MockPlaybackEngine: StreamPlaybackEngine {
+private final class MockPlaybackEngine: StreamPlaybackEngine, PlaybackFrameActivityReporting {
     var onStateChange: ((StreamPlaybackState) -> Void)?
     var onStatisticsChange: ((PlaybackStatistics?) -> Void)?
     private(set) var prepareCallCount = 0
+    private(set) var startCallCount = 0
+    private(set) var stopCallCount = 0
+    var lastVideoFrameWallClock: Date?
 
     func prepare(endpoint: CameraEndpoint) throws {
         prepareCallCount += 1
     }
 
-    func start() {}
+    func start() {
+        startCallCount += 1
+    }
 
     func stop() {
+        stopCallCount += 1
         onStateChange?(.stopped)
     }
 

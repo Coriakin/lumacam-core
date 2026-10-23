@@ -12,6 +12,10 @@ public final class CameraSession {
     public private(set) var lastError: PlaybackError?
     public private(set) var isVisible = false
     public private(set) var isAudioEnabled = false
+    public private(set) var audioVolume: Float = 1.0
+    public private(set) var audioLevel01: Float = 0
+    public private(set) var lastAudioActivity: Date?
+    public private(set) var audioDebugSnapshot: AudioDebugSnapshot?
     /// True when `.playing` but no new video frames have reached the display pipeline for `videoStallThreshold`.
     public private(set) var isVideoStallSuspected = false
 
@@ -20,9 +24,12 @@ public final class CameraSession {
     /// No new `lastVideoFrameWallClock` for this long while `.playing` ⇒ treat as stalled (if the engine reports a clock).
     private let videoStallThreshold: Duration
     private let stallPollInterval: Duration
+    private let activationRecoveryDelay: Duration
     private var reconnectTask: Task<Void, Never>?
     private var connectionTimeoutTask: Task<Void, Never>?
     private var stallMonitorTask: Task<Void, Never>?
+    private var audioMonitorTask: Task<Void, Never>?
+    private var activationRecoveryTask: Task<Void, Never>?
     private var isUserInitiatedConnection = false
     private var reconnectAttempt = 0
     private var ignoreNextStop = false
@@ -35,7 +42,8 @@ public final class CameraSession {
         reconnectPolicy: ReconnectPolicy = ReconnectPolicy(),
         connectionTimeout: Duration = .seconds(10),
         videoStallThreshold: Duration = .seconds(5),
-        stallPollInterval: Duration = .milliseconds(500)
+        stallPollInterval: Duration = .milliseconds(500),
+        activationRecoveryDelay: Duration = .seconds(2)
     ) {
         self.profile = profile
         self.engine = engine
@@ -43,6 +51,7 @@ public final class CameraSession {
         self.connectionTimeout = connectionTimeout
         self.videoStallThreshold = videoStallThreshold
         self.stallPollInterval = stallPollInterval
+        self.activationRecoveryDelay = activationRecoveryDelay
 
         LumaCamDiagnostics.log(
             "session created session=\(sessionID.uuidString.lowercased()) \(profile.diagnosticsSummary)",
@@ -84,10 +93,19 @@ public final class CameraSession {
         reconnectTask?.cancel()
         connectionTimeoutTask?.cancel()
         stopStallMonitoring()
+        stopAudioMonitoring()
         reconnectAttempt = 0
         ignoreNextStop = true
         engine.stop()
         startEngine()
+    }
+
+    public func setAudioVolume(_ volume01: Float) {
+        let v = max(0, min(1, volume01))
+        audioVolume = v
+        if let vol = engine as? AudioVolumeConfigurableStreamPlaybackEngine {
+            vol.setAudioVolume(v)
+        }
     }
 
     public func connect() {
@@ -99,6 +117,8 @@ public final class CameraSession {
         reconnectTask?.cancel()
         connectionTimeoutTask?.cancel()
         stopStallMonitoring()
+        stopAudioMonitoring()
+        cancelActivationRecovery()
         reconnectAttempt = 0
         isUserInitiatedConnection = true
         startEngine()
@@ -113,6 +133,8 @@ public final class CameraSession {
         reconnectTask?.cancel()
         connectionTimeoutTask?.cancel()
         stopStallMonitoring()
+        stopAudioMonitoring()
+        cancelActivationRecovery()
         isUserInitiatedConnection = false
         ignoreNextStop = true
         engine.stop()
@@ -133,6 +155,8 @@ public final class CameraSession {
             reconnectTask?.cancel()
             connectionTimeoutTask?.cancel()
             stopStallMonitoring()
+            stopAudioMonitoring()
+            cancelActivationRecovery()
             if state.isActivePlayback {
                 LumaCamDiagnostics.log(
                     "visibility change stopping active playback session=\(sessionID.uuidString.lowercased())",
@@ -152,6 +176,30 @@ public final class CameraSession {
         }
     }
 
+    /// Called when the hosting app becomes active again after backgrounding.
+    ///
+    /// The live viewer already reconnects when visibility returns, but some cameras appear to leave the
+    /// session in a `.playing` state while no fresh frames arrive. In that case, wait briefly for frames to
+    /// resume and then force a reconnect automatically.
+    public func handleAppDidBecomeActive() {
+        guard isVisible, isUserInitiatedConnection else { return }
+
+        activationRecoveryTask?.cancel()
+        let delay = activationRecoveryDelay
+        activationRecoveryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.performActivationRecoveryCheck()
+            }
+        }
+    }
+
     private func startEngine() {
         do {
             connectionGeneration += 1
@@ -164,6 +212,9 @@ public final class CameraSession {
             state = reconnectAttempt == 0 ? .preparing : .reconnecting(attempt: reconnectAttempt, delay: .zero)
             if let audioEngine = engine as? AudioConfigurableStreamPlaybackEngine {
                 audioEngine.setAudioEnabled(isAudioEnabled)
+            }
+            if let vol = engine as? AudioVolumeConfigurableStreamPlaybackEngine {
+                vol.setAudioVolume(audioVolume)
             }
             try engine.prepare(endpoint: profile.endpoint)
             LumaCamDiagnostics.log(
@@ -213,27 +264,34 @@ public final class CameraSession {
 
         switch newState {
         case .playing:
+            cancelActivationRecovery()
             connectionTimeoutTask?.cancel()
             reconnectAttempt = 0
             lastError = nil
             startStallMonitoring()
+            startAudioMonitoring()
         case let .failed(error):
             finishWithFailure(error)
         case .stopped:
             connectionTimeoutTask?.cancel()
             stopStallMonitoring()
+            stopAudioMonitoring()
             scheduleReconnectIfNeeded()
         case .idle:
             connectionTimeoutTask?.cancel()
             stopStallMonitoring()
+            stopAudioMonitoring()
         case .preparing, .connecting, .reconnecting:
             stopStallMonitoring()
+            stopAudioMonitoring()
         }
     }
 
     private func finishWithFailure(_ error: PlaybackError) {
+        cancelActivationRecovery()
         connectionTimeoutTask?.cancel()
         stopStallMonitoring()
+        stopAudioMonitoring()
         lastError = error
         state = .failed(error)
         LumaCamDiagnostics.log(
@@ -348,6 +406,19 @@ public final class CameraSession {
         isVideoStallSuspected = false
     }
 
+    private func cancelActivationRecovery() {
+        activationRecoveryTask?.cancel()
+        activationRecoveryTask = nil
+    }
+
+    private func stopAudioMonitoring() {
+        audioMonitorTask?.cancel()
+        audioMonitorTask = nil
+        audioLevel01 = 0
+        lastAudioActivity = nil
+        audioDebugSnapshot = nil
+    }
+
     private func startStallMonitoring() {
         stopStallMonitoring()
         let threshold = videoStallThreshold
@@ -382,6 +453,41 @@ public final class CameraSession {
         return TimeInterval(parts.seconds) + TimeInterval(parts.attoseconds) / 1e18
     }
 
+    private func startAudioMonitoring() {
+        stopAudioMonitoring()
+
+        // Polling is cheap and keeps engine interfaces simple.
+        let poll: Duration = .milliseconds(50) // ~20 Hz
+        audioMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: poll)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self else { return }
+                    guard self.state == .playing else { return }
+
+                    if let reporter = self.engine as? AudioActivityReporting {
+                        self.audioLevel01 = reporter.audioLevel01
+                        self.lastAudioActivity = reporter.lastAudioActivity
+                    } else {
+                        self.audioLevel01 = 0
+                        self.lastAudioActivity = nil
+                    }
+
+                    if let debug = self.engine as? AudioDebugReporting {
+                        self.audioDebugSnapshot = debug.audioDebugSnapshot
+                    } else {
+                        self.audioDebugSnapshot = nil
+                    }
+                }
+            }
+        }
+    }
+
     private func shouldIgnoreLateStop(
         previousState: StreamPlaybackState,
         newState: StreamPlaybackState
@@ -396,5 +502,49 @@ public final class CameraSession {
         case .idle, .preparing, .connecting, .playing, .stopped:
             return false
         }
+    }
+
+    private func performActivationRecoveryCheck() {
+        activationRecoveryTask = nil
+
+        guard isVisible, isUserInitiatedConnection else { return }
+
+        switch state {
+        case .failed, .stopped:
+            LumaCamDiagnostics.log(
+                "activation recovery reconnecting inactive session=\(sessionID.uuidString.lowercased()) state=\(state.diagnosticsSummary)",
+                level: .warning,
+                category: "session",
+                cameraID: profile.id
+            )
+            connect()
+        case .playing:
+            guard shouldForceRecoveryForStalledPlayback() else { return }
+            LumaCamDiagnostics.log(
+                "activation recovery restarting stalled playback session=\(sessionID.uuidString.lowercased())",
+                level: .warning,
+                category: "session",
+                cameraID: profile.id
+            )
+            reconnectAttempt = 0
+            ignoreNextStop = true
+            engine.stop()
+            startEngine()
+        case .idle, .preparing, .connecting, .reconnecting:
+            break
+        }
+    }
+
+    private func shouldForceRecoveryForStalledPlayback(now: Date = .now) -> Bool {
+        guard let reporter = engine as? PlaybackFrameActivityReporting else {
+            return false
+        }
+
+        guard let lastClock = reporter.lastVideoFrameWallClock else {
+            return true
+        }
+
+        let limit = Self.timeInterval(from: videoStallThreshold)
+        return now.timeIntervalSince(lastClock) > limit
     }
 }
