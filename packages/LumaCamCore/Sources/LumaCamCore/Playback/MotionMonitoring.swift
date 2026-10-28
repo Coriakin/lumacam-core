@@ -1,20 +1,40 @@
 import Foundation
 
-/// Whole-picture luminance comparison. Input is a fixed, small grayscale grid.
+/// Whole-picture luminance comparison. Input is a 64 × 36 grayscale grid.
 /// Subtracting the mean change suppresses exposure shifts; the pixel threshold suppresses noise.
 public struct MotionFrameDetector: Sendable {
     private var previous: [UInt8]?
+    public private(set) var changedFraction = 0.0
+    public private(set) var noiseThreshold = 0.0
     public init() {}
-    public mutating func reset() { previous = nil }
+    public mutating func reset() { previous = nil; changedFraction = 0; noiseThreshold = 0 }
 
     public mutating func observe(_ pixels: [UInt8]) -> Bool {
-        defer { previous = pixels.isEmpty ? nil : pixels }
-        guard !pixels.isEmpty, let previous, previous.count == pixels.count else { return false }
+        changedFraction = 0
+        noiseThreshold = 0
+        defer { previous = pixels.count == 64 * 36 ? pixels : nil }
+        guard pixels.count == 64 * 36, let previous, previous.count == pixels.count else { return false }
         let shift = zip(pixels, previous).reduce(0.0) { $0 + Double(Int($1.0) - Int($1.1)) } / Double(pixels.count)
-        let changed = zip(pixels, previous).reduce(0) {
-            $0 + (abs(Double(Int($1.0) - Int($1.1)) - shift) >= 16 ? 1 : 0)
+        let residuals = zip(pixels, previous).map { abs(Double(Int($0.0) - Int($0.1)) - shift) }
+        // Typical frame-to-frame changes estimate the camera's noise floor. This allows
+        // coherent low-contrast infrared texture to count without amplifying random sensor noise.
+        let sorted = residuals.sorted()
+        noiseThreshold = max(2, sorted[sorted.count / 2] * 3)
+        let significant = residuals.map { $0 >= noiseThreshold }
+        var coherent = 0
+        for index in significant.indices where significant[index] {
+            let x = index % 64, y = index / 64
+            var neighbors = 0
+            for dy in -1...1 {
+                for dx in -1...1 where dx != 0 || dy != 0 {
+                    let nx = x + dx, ny = y + dy
+                    if nx >= 0, nx < 64, ny >= 0, ny < 36, significant[ny * 64 + nx] { neighbors += 1 }
+                }
+            }
+            if neighbors >= 2 { coherent += 1 }
         }
-        return Double(changed) / Double(pixels.count) >= 0.015
+        changedFraction = Double(coherent) / Double(pixels.count)
+        return changedFraction >= 0.004
     }
 }
 

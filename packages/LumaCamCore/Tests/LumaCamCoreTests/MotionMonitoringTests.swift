@@ -78,6 +78,51 @@ final class MotionMonitoringTests: XCTestCase {
         XCTAssertFalse(activity.observe(motion: true, at: 200).shouldChime)
     }
 
+    func testSlowLowContrastNightVisionTextureBeatsSensorNoise() {
+        var detector = MotionFrameDetector()
+        func frame(offset: Int, noiseSeed: Int = 0, moving: Bool = true) -> [UInt8] {
+            (0..<(64 * 36)).map { index in
+                let x = index % 64, y = index / 64
+                let inside = moving && x >= 16 + offset && x < 40 + offset && y >= 10 && y < 28
+                let texture = inside ? ((x - offset + y) % 6 < 3 ? 10 : 2) : 0
+                let noise = noiseSeed == 0 ? 0 : ((index * 17 + noiseSeed * 31 + index / 7) % 9) - 4
+                return UInt8(80 + texture + noise)
+            }
+        }
+        _ = detector.observe(frame(offset: 0))
+        XCTAssertTrue(detector.observe(frame(offset: 1)), "Slow 2–10-luma textured movement must be visible to the detector")
+        detector.reset()
+        _ = detector.observe(frame(offset: 0, noiseSeed: 1, moving: false))
+        for seed in 2...20 {
+            XCTAssertFalse(detector.observe(frame(offset: 0, noiseSeed: seed, moving: false)), "Uncorrelated +/-4 night-vision noise must stay quiet")
+        }
+    }
+
+    func testCoherentThreeLumaChangesAfterCellAveragingRemainVisible() {
+        var detector = MotionFrameDetector()
+        let still = [UInt8](repeating: 80, count: 64 * 36)
+        _ = detector.observe(still)
+        var moving = still
+        for y in 10..<22 { for x in 16..<32 { moving[y * 64 + x] = 83 } }
+        XCTAssertTrue(detector.observe(moving), "Cell averaging attenuates soft night-vision texture; coherent 3-luma changes must survive")
+    }
+
+    func testSparseRandomInfraredNoiseDoesNotCountAsCoherentMotion() {
+        var detector = MotionFrameDetector()
+        var seed: UInt64 = 42
+        for _ in 0..<40 {
+            var pixels = [UInt8](repeating: 80, count: 64 * 36)
+            for index in pixels.indices {
+                seed = seed &* 6364136223846793005 &+ 1
+                if seed % 100 < 1 { pixels[index] = seed & 256 == 0 ? 45 : 115 }
+            }
+            XCTAssertFalse(detector.observe(pixels), "Sparse independent infrared speckles must not indicate movement")
+        }
+        XCTAssertFalse(detector.observe([]))
+        XCTAssertEqual(detector.changedFraction, 0)
+        XCTAssertEqual(detector.noiseThreshold, 0)
+    }
+
     func testSettingsDefaultsAndDisable() {
         let name = UUID().uuidString
         let defaults = UserDefaults(suiteName: name)!
