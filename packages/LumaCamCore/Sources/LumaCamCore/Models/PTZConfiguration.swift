@@ -96,13 +96,21 @@ public struct PTZONVIFConfiguration: Codable, Equatable, Sendable {
     }
 }
 
+public enum PTZZoomMode: String, Codable, Equatable, Sendable, CaseIterable {
+    case automatic
+    case software
+    case optical
+}
+
 public struct PTZConfiguration: Codable, Equatable, Sendable {
     public var backend: PTZBackendKind
+    public var zoomMode: PTZZoomMode
     public var http: PTZHTTPConfiguration
     public var onvif: PTZONVIFConfiguration
 
     enum CodingKeys: String, CodingKey {
         case backend
+        case zoomMode
         case http
         case onvif
     }
@@ -110,9 +118,11 @@ public struct PTZConfiguration: Codable, Equatable, Sendable {
     public init(
         backend: PTZBackendKind = .disabled,
         http: PTZHTTPConfiguration = PTZHTTPConfiguration(),
-        onvif: PTZONVIFConfiguration = PTZONVIFConfiguration()
+        onvif: PTZONVIFConfiguration = PTZONVIFConfiguration(),
+        zoomMode: PTZZoomMode = .automatic
     ) {
         self.backend = backend
+        self.zoomMode = zoomMode
         self.http = http
         self.onvif = onvif
     }
@@ -120,6 +130,7 @@ public struct PTZConfiguration: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         backend = try c.decode(PTZBackendKind.self, forKey: .backend)
+        zoomMode = try c.decodeIfPresent(PTZZoomMode.self, forKey: .zoomMode) ?? .automatic
         http = try c.decodeIfPresent(PTZHTTPConfiguration.self, forKey: .http) ?? PTZHTTPConfiguration()
         onvif = try c.decodeIfPresent(PTZONVIFConfiguration.self, forKey: .onvif) ?? PTZONVIFConfiguration()
     }
@@ -127,6 +138,7 @@ public struct PTZConfiguration: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(backend, forKey: .backend)
+        try c.encode(zoomMode, forKey: .zoomMode)
         try c.encode(http, forKey: .http)
         try c.encode(onvif, forKey: .onvif)
     }

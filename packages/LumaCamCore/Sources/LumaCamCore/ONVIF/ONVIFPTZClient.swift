@@ -7,6 +7,7 @@ public final class ONVIFPTZClient: @unchecked Sendable {
         public var mediaServiceURL: URL
         public var ptzServiceURL: URL
         public var profileToken: String
+        public var ptzConfigurationToken: String? = nil
     }
 
     private let urlSession: URLSession
@@ -18,6 +19,27 @@ public final class ONVIFPTZClient: @unchecked Sendable {
 
     public func invalidateCache(cameraID: UUID) {
         _ = cache.withLock { $0.removeValue(forKey: cameraID) }
+    }
+
+    /// Queries the selected profile, not an unrelated PTZ node. Errors mean unknown support.
+    public func supportsContinuousZoom(profile: CameraProfile) async throws -> Bool {
+        let (user, pass) = try credentials(from: profile)
+        let binding = try await binding(for: profile, username: user, password: pass)
+        guard let token = binding.ptzConfigurationToken else {
+            throw ONVIFPTZError.parseError("Selected profile has no PTZ configuration token.")
+        }
+        let data = try await soapPOST(
+            url: binding.ptzServiceURL,
+            soapAction: "http://www.onvif.org/ver20/ptz/wsdl/GetConfigurationOptions",
+            envelopeBody: """
+            <tptz:GetConfigurationOptions xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+              <tptz:ConfigurationToken>\(Self.escapeXML(token))</tptz:ConfigurationToken>
+            </tptz:GetConfigurationOptions>
+            """,
+            username: user, password: pass
+        )
+        try Self.throwIfSOAPFault(String(data: data, encoding: .utf8) ?? "")
+        return try ONVIFZoomCapabilityParsing.supportsContinuousZoom(data)
     }
 
     public func continuousMove(profile: CameraProfile, pan: Float, tilt: Float, zoom: Float) async throws {
@@ -170,7 +192,9 @@ public final class ONVIFPTZClient: @unchecked Sendable {
         try Self.throwIfSOAPFault(profilesString)
 
         let token = try Self.pickProfileToken(from: profilesString)
-        let binding = Binding(mediaServiceURL: mediaURL, ptzServiceURL: ptzURL, profileToken: token)
+        let configurationToken = try ONVIFZoomCapabilityParsing.configurationToken(profilesData, profileToken: token)
+        let binding = Binding(mediaServiceURL: mediaURL, ptzServiceURL: ptzURL, profileToken: token,
+                              ptzConfigurationToken: configurationToken)
 
         cache.withLock { $0[profile.id] = binding }
         return binding
@@ -381,8 +405,8 @@ public final class ONVIFPTZClient: @unchecked Sendable {
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
         let ns = xml as NSString
         let full = NSRange(location: 0, length: ns.length)
-        guard let m = regex.firstMatch(in: xml, options: [], range: full), m.numberOfRanges >= 3 else { return nil }
-        let r = m.range(at: 2)
+        guard let m = regex.firstMatch(in: xml, options: [], range: full), m.numberOfRanges >= 2 else { return nil }
+        let r = m.range(at: 1)
         guard r.location != NSNotFound else { return nil }
         return ns.substring(with: r)
     }
